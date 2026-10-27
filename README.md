@@ -1,1 +1,1 @@
-# Zarathustra
+# Zarathus

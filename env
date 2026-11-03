@@ -1,7 +1,7 @@
 # Aegis 설정 파일
 # Google AI Studio(https://aistudio.google.com/apikey)에서 받은 'AIza…' 키를 아래에 붙여넣으세요.
 # 따옴표 없이, 등호 양쪽에 공백 없이 한 줄로 적습니다.
-GEMINI_API_KEY=YOUR_GEMINI_API_KEY
+GEMINI_API_KEY=AQ.Ab8RN6J1NWBc-7nwcDpg4cJlNoFsoa4H81eSDzfNj_K64kcsUQ
 
 # 선택 사항
 GEMINI_MODEL=gemini-flash-latest

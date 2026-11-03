@@ -1,51 +1,49 @@
 # Aegis Financial Intelligence — Gemini Edition
 
-모든 앱 코드는 단일 `main.py`에 들어 있습니다. GitHub 저장소 루트에 `main.py`, `requirements.txt`, `README.md`, `LICENSE`, `.gitignore` 5개 파일만 올리면 됩니다.
+모든 앱 코드는 단일 `main.py`에 들어 있습니다. GitHub 저장소 루트에 `main.py`, `requirements.txt`, `README.md`, `LICENSE`, `.gitignore`, `.env` 6개 파일을 올리면 됩니다.
 
-## 주요 변경점 (Ollama → Gemini)
-- **Google Gemini API** (`google-genai` SDK)로 전환
-- **사고(thinking) 시스템**: 사이드바에서 사고 수준(minimal / low / medium / high)을 고르고, 모델의 **사고 요약을 실시간 스트리밍**으로 볼 수 있습니다. Gemini 3.x 계열은 `thinking_level`, 2.5 계열은 `thinking_budget`을 자동으로 사용합니다. 응답마다 입력·사고·출력 토큰 수를 표시합니다.
-- **Google 뉴스**: 종목별 Google News RSS를 병렬 수집해 시장 탭·뉴스 탭에 표시 (한국어/영어, 기간·기사 수 조절, CSV 다운로드)
-- **뉴스 반영 시나리오 예측**: Gemini가 뉴스 헤드라인과 시장 통계를 읽고 JSON 스키마(구조화 출력)로
-  강세/기준/약세 확률, 연 기대수익 조정, 변동성 배수, 꼬리 이벤트(확률·충격), 근거 헤드라인을 산출 →
-  **몬테카를로 엔진**(Student-t 두꺼운 꼬리 + 포아송 점프 + 시나리오 혼합)에 그대로 입력합니다.
-  LLM 출력은 안전 범위로 클램프되고 확률은 정규화되며, 모든 파라미터는 슬라이더로 직접 조정할 수 있습니다.
-  API 키가 없으면 규칙 기반 감성 점수로 대체합니다.
-- **AI 애널리스트**: 멀티턴 대화 + 시장 통계·뉴스·시나리오 결과를 컨텍스트로 사용
+## 이번 변경점
+### Yahoo Finance 전 종목 지원
+- 사이드바 **🔎 Yahoo Finance 종목 검색**: 회사명·티커·한국 6자리 코드로 검색해 결과에서 골라 추가합니다. 주식·ETF·지수·펀드·암호화폐·환율·선물 등 Yahoo Finance에서 조회되는 모든 심볼을 찾을 수 있습니다.
+- **관심 종목** 칸에 티커를 직접 입력할 수도 있습니다 (예: `AAPL`, `005930.KS`, `035720.KQ`, `^KS11`, `BTC-USD`, `KRW=X`, `GC=F`). 6자리 한국 코드만 넣으면 `.KS`/`.KQ`를 자동으로 붙입니다.
+- **프리셋**: 미국 빅테크, 한국 대형주, 주요 지수, 대표 ETF, 암호화폐, 환율·원자재를 한 번에 추가.
+- 종목 수 제한(기존 15개)을 없앴고, 시장 탭에 모든 종목 지표를 격자로 표시합니다. 30개를 넘으면 속도 안내만 표시합니다.
+- 시나리오 예측 탭에서 **Gemini 분석 대상 종목**을 따로 고를 수 있어 종목이 많아도 요청을 가볍게 유지할 수 있습니다.
+- 조회 기간에 `max` 추가.
 
-## 성능 개선
-- yfinance **일괄 다운로드**(멀티스레드) — 종목 수만큼 요청하던 방식 → 1회 요청 (실패 종목만 개별 재시도)
-- 기업 정보·뉴스 **병렬 수집**(ThreadPoolExecutor) + 캐시(가격 15분, 뉴스 10분, 기업정보 24시간)
-- 각 탭을 `st.fragment`로 분리 → 슬라이더를 움직여도 해당 탭만 다시 계산
-- 지표·백테스트·DCF·몬테카를로를 numpy **벡터화** (2만 경로 × 126일 시뮬레이션 약 0.5초)
-- Gemini 클라이언트 재사용(`st.cache_resource`), 시나리오 결과를 세션에 보관하고 뉴스가 바뀌면 재생성 안내
+### API 키를 `.env`로 관리
+- `.env` 파일을 저장소에 함께 올리고, 앱이 `python-dotenv`로 읽습니다. `.gitignore`에서 `.env`를 뺐습니다.
+- 읽는 순서: 환경변수(`.env` 포함) → Streamlit Secrets. 기존 Secrets 설정도 계속 동작합니다.
 
-## 추가 분석 기능
-- 포트폴리오: 소르티노·칼마·베타·젠센 알파·추적오차(벤치마크 대비), 낙폭·롤링 변동성 차트, 위험 기여도
-- 백테스트: 거래비용(bps) 반영, 이동평균 파라미터 그리드 탐색 히트맵
-- DCF: yfinance 값으로 기본값 채움, 주당 내재가치, WACC × 영구성장률 민감도 히트맵
-- 시장: 캔들 차트 + 이동평균
+## 설정 (`.env`)
+```env
+GEMINI_API_KEY=여기에_발급받은_키
+GEMINI_MODEL=gemini-flash-latest
+GEMINI_THINKING_LEVEL=high
+```
+- `GOOGLE_API_KEY`라는 이름도 인식합니다.
+- `GEMINI_MODEL`을 생략하면 `gemini-flash-latest`를 씁니다. 사이드바에서도 바꿀 수 있습니다.
+
+> **주의:** 공개(public) 저장소에 키를 올리면 Google이 키를 '유출됨'으로 자동 차단해 `Your API key was reported as leaked` 오류가 날 수 있고, 다른 사람이 키를 써서 할당량이 소진될 수 있습니다. 저장소를 **비공개(private)** 로 두는 것을 권장합니다. 차단되면 새 키를 발급해 `.env`만 바꾸면 됩니다.
 
 ## Streamlit Cloud 배포
-1. 파일 5개를 GitHub 저장소 루트에 업로드합니다.
+1. 파일 6개를 GitHub 저장소 루트에 업로드합니다. (`.env`는 점으로 시작하는 숨김 파일이라 탐색기에서 안 보일 수 있습니다. GitHub에서 **Add file → Create new file**로 이름을 `.env`로 직접 만들어도 됩니다.)
 2. Streamlit Community Cloud에서 저장소를 연결하고 Main file path를 `main.py`로 지정합니다.
-3. 앱 Settings → Secrets에 아래 TOML을 입력합니다.
-
-```toml
-GEMINI_API_KEY = "YOUR_GEMINI_API_KEY"       # Google AI Studio에서 발급
-GEMINI_MODEL = "gemini-flash-latest"         # 선택 사항
-GEMINI_THINKING_LEVEL = "high"               # 선택 사항: minimal / low / medium / high
-```
-
-- `GEMINI_MODEL`을 생략하면 항상 최신 Flash 모델을 가리키는 `gemini-flash-latest`를 사용합니다. 특정 버전을 고정하려면 Google AI Studio의 모델 목록에서 확인한 모델 ID(예: `gemini-3.7-flash`)를 넣으세요. 사이드바에서도 바꿀 수 있습니다.
-- `GOOGLE_API_KEY`라는 이름도 인식합니다.
+3. Secrets 설정은 필요 없습니다.
 
 ## 로컬 실행
 ```bash
 pip install -r requirements.txt
 streamlit run main.py
 ```
-로컬에서는 `.streamlit/secrets.toml`에 위 내용을 넣으면 됩니다(이 파일은 `.gitignore`에 포함되어 GitHub에 올라가지 않습니다).
+
+## 기존 기능
+- **Gemini 사고 모드**: 사고 수준(minimal/low/medium/high), 사고 요약 실시간 스트리밍, 토큰 사용량 표시. 3.x는 `thinking_level`, 2.5는 `thinking_budget` 자동 사용.
+- **Google 뉴스**: 종목별 Google News RSS 병렬 수집 (한국어/영어, 기간·기사 수 조절, CSV 다운로드)
+- **뉴스 반영 시나리오 예측**: Gemini가 헤드라인·시장 통계로 강세/기준/약세 확률, drift 조정, 변동성 배수, 꼬리 이벤트를 JSON으로 산출 → Student-t + 포아송 점프 몬테카를로. 키가 없으면 규칙 기반 감성으로 대체.
+- **AI 애널리스트**: 멀티턴 대화, 시장 통계·뉴스·시나리오 결과를 컨텍스트로 사용
+- 포트폴리오 위험(소르티노·칼마·베타·알파·추적오차·위험 기여도), 이동평균 백테스트 + 그리드 탐색, DCF + 민감도 히트맵
+- yfinance 일괄 다운로드, 병렬 수집, 캐시, `st.fragment` 탭 분리, numpy 벡터화
 
 ## 한계
-교육·연구용 예제입니다. 시장 데이터는 지연·누락·수정될 수 있고, Google News RSS는 공식 API가 아니므로 형식 변경이나 요청 제한이 있을 수 있습니다. 뉴스 해석과 시나리오 파라미터는 LLM 판단이라 틀릴 수 있으며, 몬테카를로 결과는 확률 모형의 출력이지 가격 예측 보장이 아닙니다. 백테스트는 세금·슬리피지·체결 제약을 반영하지 않습니다. 투자 주문을 실행하지 않으며 개인 맞춤 투자 자문이 아닙니다.
+교육·연구용 예제입니다. 시장 데이터는 지연·누락·수정될 수 있고, Yahoo Finance 검색과 Google News RSS는 공식 API가 아니므로 형식 변경이나 요청 제한이 있을 수 있습니다. 종목을 매우 많이 추가하면 요청 제한에 걸릴 수 있습니다. 통화가 다른 종목을 섞은 포트폴리오는 환율 효과를 반영하지 않습니다. 뉴스 해석과 시나리오 파라미터는 LLM 판단이라 틀릴 수 있으며, 몬테카를로 결과는 확률 모형의 출력이지 가격 예측 보장이 아닙니다. 투자 주문을 실행하지 않으며 개인 맞춤 투자 자문이 아닙니다.

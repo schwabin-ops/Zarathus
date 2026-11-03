@@ -1,8 +1,11 @@
 """Aegis Financial Intelligence — Gemini Edition (single-file Streamlit app).
 
+- 종목 선택: Yahoo Finance 검색(주식·ETF·지수·암호화폐·환율·선물 등 Yahoo에서 조회 가능한 모든 심볼)
+  + 프리셋 + 직접 입력, 종목 수 제한 없음
 - 시장 데이터: yfinance 일괄(batch) 다운로드 + 캐시
 - 뉴스: Google News RSS 병렬 수집 + 캐시
 - AI: Google Gemini (google-genai SDK) — 사고(thinking) 모드, 사고 요약 스트리밍, JSON 구조화 출력
+- API 키: 저장소의 .env 파일(python-dotenv)에서 읽음. 환경변수·Streamlit Secrets도 대체 경로로 인식
 - 시나리오 예측: Gemini가 뉴스를 읽어 강세/기준/약세 시나리오 파라미터를 산출 →
   벡터화 몬테카를로(두꺼운 꼬리 + 이벤트 점프) 엔진에 반영
 """
@@ -11,11 +14,13 @@ from __future__ import annotations
 import hashlib
 import html
 import json
+import os
 import re
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
+from pathlib import Path
 from urllib.parse import quote_plus
 
 import numpy as np
@@ -26,11 +31,30 @@ import requests
 import streamlit as st
 import yfinance as yf
 
+# .env 파일(main.py와 같은 폴더)에서 GEMINI_API_KEY 등을 환경변수로 불러옴
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv(Path(__file__).resolve().with_name(".env"), override=False)
+except ImportError:  # python-dotenv 미설치 시에도 앱은 동작(환경변수/Secrets 사용)
+    pass
+
 TRADING_DAYS = 252
 DEFAULT_MODEL = "gemini-flash-latest"
 THINKING_LEVELS = ["minimal", "low", "medium", "high"]
 # Gemini 2.5 계열은 thinking_level 대신 토큰 예산을 사용
 THINKING_BUDGET_25 = {"minimal": 512, "low": 2048, "medium": 8192, "high": 24576}
+
+DEFAULT_TICKERS = ["AAPL", "MSFT", "NVDA"]
+SOFT_TICKER_LIMIT = 30  # 이보다 많으면 느려질 수 있다는 안내만 표시(제한 아님)
+PRESETS = {
+    "미국 빅테크": ["AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "META", "TSLA"],
+    "한국 대형주": ["005930.KS", "000660.KS", "373220.KS", "207940.KS", "005380.KS", "035420.KS", "035720.KS"],
+    "주요 지수": ["^GSPC", "^IXIC", "^DJI", "^KS11", "^KQ11", "^N225"],
+    "대표 ETF": ["SPY", "QQQ", "VTI", "SCHD", "TLT", "GLD"],
+    "암호화폐": ["BTC-USD", "ETH-USD", "SOL-USD", "XRP-USD"],
+    "환율·원자재": ["KRW=X", "JPY=X", "GC=F", "CL=F", "SI=F"],
+}
 
 
 # =============================================================================
@@ -92,7 +116,7 @@ def risk_contributions(returns: pd.DataFrame, weights: dict[str, float]) -> pd.D
     w = w / w.sum()
     cov = returns[cols].dropna().cov().to_numpy() * TRADING_DAYS
     port_var = float(w @ cov @ w)
-    if port_var <= 0:
+    if not np.isfinite(port_var) or port_var <= 0:
         return pd.DataFrame()
     mrc = cov @ w
     rc = w * mrc / port_var
@@ -218,6 +242,7 @@ def monte_carlo_scenarios(close: pd.Series, scenarios: dict, horizon_days: int =
     tail_prob: 연간 이벤트(점프) 발생확률, tail_impact: 발생 시 로그 가격 충격(음수=하락)
     """
     c = pd.Series(close).dropna().astype(float)
+    c = c[c > 0]
     logr = np.diff(np.log(c.to_numpy()))
     if logr.size < 30:
         raise ValueError("시뮬레이션에 필요한 가격 데이터가 부족합니다(최소 30일).")
@@ -366,6 +391,51 @@ def fetch_news_parallel(queries: dict[str, str], lang: str, days: int, limit: in
     return news, errors
 
 
+# ----------------------------- Yahoo Finance 종목 검색 -----------------------------
+@st.cache_data(ttl=3600, show_spinner=False)
+def search_yahoo_tickers(query: str, max_results: int = 20) -> list[dict]:
+    """Yahoo Finance 검색 — 주식·ETF·지수·뮤추얼펀드·암호화폐·환율·선물 등 모든 심볼."""
+    query = (query or "").strip()
+    if not query:
+        return []
+    quotes: list[dict] = []
+    try:
+        quotes = yf.Search(query, max_results=max_results, news_count=0).quotes or []
+    except Exception:  # noqa: BLE001  (yfinance 버전에 Search가 없거나 실패 시 직접 호출)
+        quotes = []
+    if not quotes:
+        try:
+            resp = requests.get("https://query2.finance.yahoo.com/v1/finance/search",
+                                params={"q": query, "quotesCount": max_results, "newsCount": 0},
+                                headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+            resp.raise_for_status()
+            quotes = resp.json().get("quotes", []) or []
+        except Exception:  # noqa: BLE001
+            return []
+    out, seen = [], set()
+    for q in quotes:
+        sym = str(q.get("symbol") or "").strip()
+        if not sym or sym in seen:
+            continue
+        seen.add(sym)
+        out.append({"symbol": sym,
+                    "name": q.get("shortname") or q.get("longname") or "",
+                    "exchange": q.get("exchDisp") or q.get("exchange") or "",
+                    "type": q.get("typeDisp") or q.get("quoteType") or ""})
+    return out
+
+
+def normalize_ticker(sym: str) -> str:
+    """대문자화 + 한국 6자리 종목코드를 .KS/.KQ 심볼로 변환."""
+    s = str(sym).strip().upper()
+    if re.fullmatch(r"\d{6}", s):
+        for r in search_yahoo_tickers(s):
+            if r["symbol"].upper().startswith(s + "."):
+                return r["symbol"].upper()
+        return s + ".KS"
+    return s
+
+
 # ----------------------------- Market data -----------------------------
 @st.cache_data(ttl=900, show_spinner=False)
 def get_price_batch(tickers: tuple[str, ...], period: str) -> dict[str, pd.DataFrame]:
@@ -400,7 +470,7 @@ def get_company_info(ticker: str) -> dict:
         info = yf.Ticker(ticker).get_info()
         keys = ["longName", "shortName", "industry", "sector", "longBusinessSummary", "marketCap",
                 "currency", "trailingPE", "forwardPE", "freeCashflow", "totalDebt", "totalCash",
-                "sharesOutstanding"]
+                "sharesOutstanding", "quoteType"]
         return {k: info.get(k) for k in keys if info.get(k) is not None}
     except Exception:  # noqa: BLE001
         return {}
@@ -413,18 +483,25 @@ def get_infos_parallel(tickers: list[str]) -> dict[str, dict]:
 
 def news_query_for(ticker: str, info: dict) -> str:
     name = info.get("shortName") or info.get("longName")
+    base = ticker.split(".")[0].lstrip("^")
     if not name:
-        return ticker
+        return re.sub(r"[=^]", " ", ticker).strip() or ticker
     name = re.sub(r"\b(Inc\.?|Corporation|Corp\.?|Co\.?,? ?Ltd\.?|Ltd\.?|plc|N\.V\.|Holdings?)\b", "", name)
-    name = re.sub(r"[,\s]+$", "", name).strip()
-    base = ticker.split(".")[0]
-    return f"\"{name}\"" if base.isdigit() else f"\"{name}\" OR {base}"
+    name = re.sub(r"[,.\s]+$", "", name).strip()
+    # 일반 주식 티커(영문 1~5자)만 OR 조건에 추가. 지수·암호화폐·환율·선물·한국 코드는 이름으로만 검색
+    if re.fullmatch(r"[A-Z]{1,5}", base) and "^" not in ticker and "=" not in ticker:
+        return f"\"{name}\" OR {base}"
+    return f"\"{name}\""
 
 
 # =============================================================================
 # Gemini client
 # =============================================================================
 def read_secret(key: str, default: str = "") -> str:
+    """1) 환경변수(.env 포함) → 2) Streamlit Secrets 순서로 읽음."""
+    v = os.getenv(key)
+    if v and v.strip():
+        return v.strip()
     try:
         return str(st.secrets.get(key, default)).strip()
     except Exception:  # noqa: BLE001
@@ -438,7 +515,25 @@ def get_gemini_client(api_key: str):
 
 
 def gemini_api_key() -> str:
-    return read_secret("GEMINI_API_KEY") or read_secret("GOOGLE_API_KEY")
+    key = read_secret("GEMINI_API_KEY") or read_secret("GOOGLE_API_KEY")
+    return "" if key.upper().startswith("YOUR_") else key
+
+
+def gemini_key_source() -> str:
+    if os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY"):
+        return ".env"
+    return "Secrets"
+
+
+def gemini_error_message(exc: Exception) -> str:
+    msg = str(exc)
+    low = msg.lower()
+    if "leaked" in low:
+        return (msg + "\n\nGoogle이 이 API 키를 '유출된 키'로 판단해 차단했습니다. Google AI Studio에서 새 키를 "
+                "발급해 .env의 GEMINI_API_KEY를 바꾸고, 저장소를 비공개(private)로 두세요.")
+    if "api_key_invalid" in low or "api key not valid" in low:
+        return msg + "\n\nAPI 키가 올바르지 않습니다. .env의 GEMINI_API_KEY 값을 확인하세요."
+    return msg
 
 
 def build_gemini_config(model: str, thinking_level: str, show_thoughts: bool, system: str,
@@ -515,7 +610,8 @@ ANALYST_SYSTEM = (
 SCENARIO_SYSTEM = (
     "You are a quantitative event analyst. Read the numbered Google News headlines for each ticker and "
     "the supplied market statistics, then translate the news flow into scenario parameters for a Monte "
-    "Carlo price model over the stated horizon. Rules: base judgments only on the supplied headlines and "
+    "Carlo price model over the stated horizon. Tickers may be stocks, ETFs, indices, cryptocurrencies, "
+    "FX pairs or futures. Rules: base judgments only on the supplied headlines and "
     "data; cite headlines by their index; if news is thin, stale, or irrelevant, keep adjustments small, "
     "lower confidence and say so in data_gaps. Probabilities across bull/base/bear must sum to 1. "
     "annual_drift_adjustment is an additive change to annualized expected return (e.g. 0.05 = +5%p), "
@@ -658,6 +754,92 @@ def ticker_stats(close: pd.Series) -> dict:
             "last_date": str(c.index[-1].date())}
 
 
+# ----------------------------- 종목 선택 (사이드바) -----------------------------
+def _init_ticker_state():
+    ss = st.session_state
+    ss.setdefault("watchlist", list(DEFAULT_TICKERS))
+    ss.setdefault("ticker_options", list(DEFAULT_TICKERS))
+    ss.setdefault("ticker_names", {})
+
+
+def _add_tickers(symbols: list[str]):
+    ss = st.session_state
+    new = [normalize_ticker(s) for s in symbols if str(s).strip()]
+    ss.ticker_options = list(dict.fromkeys(ss.ticker_options + list(ss.watchlist) + new))
+    ss.watchlist = list(dict.fromkeys(list(ss.watchlist) + new))
+
+
+def _add_from_search():
+    _add_tickers(list(st.session_state.get("search_picks", [])))
+    st.session_state.search_picks = []
+
+
+def _add_preset():
+    name = st.session_state.get("preset_pick")
+    if name in PRESETS:
+        _add_tickers(PRESETS[name])
+
+
+def _normalize_watchlist():
+    ss = st.session_state
+    norm = list(dict.fromkeys(normalize_ticker(s) for s in ss.watchlist if str(s).strip()))
+    ss.ticker_options = list(dict.fromkeys(ss.ticker_options + norm))
+    ss.watchlist = norm
+
+
+def _clear_watchlist():
+    st.session_state.watchlist = []
+
+
+def _ticker_label(sym: str) -> str:
+    name = st.session_state.get("ticker_names", {}).get(sym)
+    return f"{sym} · {name}" if name else sym
+
+
+def ticker_selector() -> list[str]:
+    """Yahoo Finance 검색 + 프리셋 + 직접 입력으로 종목 수 제한 없이 선택."""
+    ss = st.session_state
+    _init_ticker_state()
+    st.header("종목 선택")
+    q = st.text_input("🔎 Yahoo Finance 종목 검색", placeholder="예: Tesla, Samsung, 005930, BTC, S&P 500",
+                      help="회사명·티커·한국 6자리 코드로 검색합니다. 주식·ETF·지수·펀드·암호화폐·환율·선물 등 "
+                           "Yahoo Finance에서 조회되는 모든 심볼을 찾을 수 있습니다.")
+    if q.strip():
+        with st.spinner("Yahoo Finance 검색 중..."):
+            results = search_yahoo_tickers(q.strip())
+        if results:
+            labels = {}
+            for r in results:
+                if r["name"]:
+                    ss.ticker_names[r["symbol"]] = r["name"]
+                meta = ", ".join(x for x in [r["exchange"], r["type"]] if x)
+                labels[r["symbol"]] = f"{r['symbol']} · {r['name']}" + (f" ({meta})" if meta else "")
+            ss.search_picks = [p for p in ss.get("search_picks", []) if p in labels]
+            st.multiselect(f"검색 결과 {len(results)}건", list(labels), format_func=lambda s: labels.get(s, s),
+                           key="search_picks", placeholder="추가할 종목을 고르세요")
+            st.button("➕ 선택 종목 추가", on_click=_add_from_search, width="stretch",
+                      disabled=not ss.get("search_picks"))
+        else:
+            st.caption("검색 결과가 없습니다. 아래 '관심 종목'에 티커를 직접 입력해도 됩니다.")
+
+    pc1, pc2 = st.columns([2, 1])
+    pc1.selectbox("프리셋", list(PRESETS), key="preset_pick", label_visibility="collapsed")
+    pc2.button("프리셋 추가", on_click=_add_preset, width="stretch")
+
+    options = list(dict.fromkeys(ss.ticker_options + list(ss.watchlist)))
+    st.multiselect("관심 종목 (티커 직접 입력 가능)", options, key="watchlist", accept_new_options=True,
+                   on_change=_normalize_watchlist, format_func=_ticker_label,
+                   placeholder="티커를 입력하고 Enter",
+                   help="예: AAPL, 005930.KS, 035720.KQ, ^KS11, BTC-USD, KRW=X, GC=F. "
+                        "6자리 한국 종목코드만 입력하면 .KS/.KQ를 자동으로 붙입니다.")
+    st.button("관심 종목 모두 비우기", on_click=_clear_watchlist, width="stretch")
+    tickers = list(ss.watchlist)
+    if len(tickers) > SOFT_TICKER_LIMIT:
+        st.caption(f"⚠️ 종목이 {len(tickers)}개입니다. 데이터·뉴스 수집과 Gemini 분석이 느려지거나 "
+                   "Yahoo 요청 제한에 걸릴 수 있습니다.")
+    return tickers
+
+
 def main():
     st.set_page_config(page_title="Aegis | Financial Intelligence", page_icon="🛡️", layout="wide",
                        initial_sidebar_state="expanded")
@@ -667,16 +849,17 @@ def main():
     ss.setdefault("scenario_ai", {})
 
     st.title("🛡️ Aegis Financial Intelligence")
-    st.caption("시장 데이터 · Google 뉴스 · 포트폴리오 위험 · 퀀트 백테스트 · DCF · Gemini 사고 모델 기반 시나리오 예측")
+    st.caption("Yahoo Finance 전 종목 · Google 뉴스 · 포트폴리오 위험 · 퀀트 백테스트 · DCF · "
+               "Gemini 사고 모델 기반 시나리오 예측")
 
     # ---------------- Sidebar ----------------
     with st.sidebar:
+        tickers = ticker_selector()
+
+        st.divider()
         st.header("분석 설정")
-        ticker_input = st.text_input("관심 종목 (쉼표 구분)", "AAPL, MSFT, NVDA",
-                                     help="한국 종목은 005930.KS, 035720.KQ 형식")
-        tickers = list(dict.fromkeys(x.strip().upper() for x in ticker_input.split(",") if x.strip()))[:15]
-        period = st.selectbox("조회 기간", ["3mo", "6mo", "1y", "2y", "5y", "10y"], index=2)
-        benchmark = st.text_input("벤치마크", "SPY", help="예: SPY, QQQ, ^KS11(코스피)").strip().upper()
+        period = st.selectbox("조회 기간", ["3mo", "6mo", "1y", "2y", "5y", "10y", "max"], index=2)
+        benchmark = st.text_input("벤치마크", "SPY", help="예: SPY, QQQ, ^GSPC, ^KS11(코스피)").strip().upper()
         rf = st.number_input("무위험 수익률 (연 %)", 0.0, 20.0, 4.0, 0.25) / 100
 
         st.divider()
@@ -689,7 +872,7 @@ def main():
         st.divider()
         st.subheader("✨ Gemini")
         key_ok = bool(gemini_api_key())
-        st.write("API 키:", "✅ 설정됨" if key_ok else "⚠️ Secrets 설정 필요")
+        st.write("API 키:", f"✅ 설정됨 ({gemini_key_source()})" if key_ok else "⚠️ .env에 GEMINI_API_KEY 필요")
         model = st.text_input("모델", read_secret("GEMINI_MODEL", DEFAULT_MODEL),
                               help="예: gemini-flash-latest, gemini-3.7-flash, gemini-3.1-pro-preview")
         default_level = read_secret("GEMINI_THINKING_LEVEL", "high")
@@ -697,26 +880,30 @@ def main():
                                           value=default_level if default_level in THINKING_LEVELS else "high",
                                           help="높을수록 깊게 추론하지만 느리고 비용이 늘어납니다.")
         show_thoughts = st.toggle("사고 요약 표시", value=True)
-        st.caption("API 키는 코드가 아닌 Streamlit Secrets에 저장하세요.")
+        st.caption("API 키는 저장소의 .env 파일(GEMINI_API_KEY)에서 읽습니다.")
         if st.button("캐시 비우고 새로고침", width="stretch"):
             st.cache_data.clear()
             ss.scenario_ai = {}
             st.rerun()
 
     if not tickers:
-        st.warning("분석할 티커를 하나 이상 입력해 주세요.")
+        st.info("👈 사이드바에서 Yahoo Finance 종목을 검색하거나 티커를 입력해 하나 이상 추가하세요.")
         st.stop()
 
     # ---------------- Data (batch + parallel) ----------------
-    with st.spinner("시장 데이터·기업 정보를 병렬로 가져오는 중..."):
+    with st.spinner(f"{len(tickers)}개 종목의 시장 데이터·기업 정보를 병렬로 가져오는 중..."):
         all_syms = tuple(dict.fromkeys(tickers + ([benchmark] if benchmark else [])))
         price_data_all = get_price_batch(all_syms, period)
         infos = get_infos_parallel(tickers)
+    for t, inf in infos.items():
+        nm = inf.get("shortName") or inf.get("longName")
+        if nm:
+            ss.ticker_names.setdefault(t, nm)
     price_data = {t: price_data_all[t] for t in tickers if t in price_data_all}
     bench_df = price_data_all.get(benchmark) if benchmark else None
     missing = [t for t in tickers if t not in price_data]
     if missing:
-        st.warning(f"가격 데이터를 가져오지 못한 종목: {', '.join(missing)}")
+        st.warning(f"가격 데이터를 가져오지 못한 종목: {', '.join(missing)} — 티커 철자나 거래소 접미사(.KS/.KQ 등)를 확인하세요.")
     available = list(price_data)
     if not available:
         st.error("가격 데이터를 가져오지 못했습니다. 티커와 네트워크를 확인하세요.")
@@ -736,18 +923,20 @@ def main():
 
     # ---------------- 시장 ----------------
     with tabs[0]:
-        cols = st.columns(min(5, len(available)))
-        for i, s in enumerate(available[:10]):
-            c = price_data[s]["Close"]
-            prev = float(c.iloc[-2]) if len(c) > 1 else float(c.iloc[-1])
-            cols[i % len(cols)].metric(s, f"{float(c.iloc[-1]):,.2f}",
-                                       f"{(float(c.iloc[-1]) / prev - 1) * 100:+.2f}%")
+        ncol = min(5, len(available))
+        for start in range(0, len(available), ncol):  # 모든 종목을 5열 격자로 표시
+            row = st.columns(ncol)
+            for col, s in zip(row, available[start:start + ncol]):
+                c = price_data[s]["Close"]
+                prev = float(c.iloc[-2]) if len(c) > 1 else float(c.iloc[-1])
+                col.metric(_ticker_label(s), f"{float(c.iloc[-1]):,.2f}",
+                           f"{(float(c.iloc[-1]) / prev - 1) * 100:+.2f}%")
         norm = prices.ffill() / prices.bfill().iloc[0] * 100
         fig = px.line(norm, title="상대 성과 (시작값 = 100)")
-        fig.update_layout(legend_title="", hovermode="x unified", height=420)
+        fig.update_layout(legend_title="", hovermode="x unified", height=460)
         st.plotly_chart(fig, width="stretch")
 
-        sel = st.selectbox("종목 상세", available, key="detail_sym")
+        sel = st.selectbox("종목 상세", available, key="detail_sym", format_func=_ticker_label)
         df = price_data[sel]
         info = infos.get(sel, {})
         c1, c2, c3, c4, c5 = st.columns(5)
@@ -764,10 +953,11 @@ def main():
         ma_fig.update_layout(height=460, xaxis_rangeslider_visible=False, title=f"{sel} 가격")
         st.plotly_chart(ma_fig, width="stretch")
         if info:
-            st.write(f"**회사:** {info.get('longName') or sel} · **섹터:** {info.get('sector', '—')} · "
-                     f"**업종:** {info.get('industry', '—')}")
+            st.write(f"**이름:** {info.get('longName') or info.get('shortName') or sel} · "
+                     f"**유형:** {info.get('quoteType', '—')} · **섹터:** {info.get('sector', '—')} · "
+                     f"**업종:** {info.get('industry', '—')} · **통화:** {info.get('currency', '—')}")
             if info.get("longBusinessSummary"):
-                with st.expander("회사 개요"):
+                with st.expander("개요"):
                     st.write(info["longBusinessSummary"])
         st.markdown(f"**최신 Google 뉴스 — {sel}**")
         render_news_list(news.get(sel, []), max_items=6)
@@ -803,7 +993,8 @@ def main():
             for a in (ai or {}).get("assessments", []):
                 if a["ticker"] == t:
                     drivers = {d["headline_index"]: d["impact"] for d in a.get("key_drivers", [])}
-            with st.expander(f"{t} · {len(news.get(t, []))}건 · 검색어: {queries[t]}", expanded=(t == available[0])):
+            with st.expander(f"{_ticker_label(t)} · {len(news.get(t, []))}건 · 검색어: {queries[t]}",
+                             expanded=(t == available[0])):
                 render_news_list(news.get(t, []), drivers, max_items=news_limit)
 
     # ---------------- 시나리오 예측 ----------------
@@ -864,22 +1055,27 @@ def scenario_tab(available, price_data, news, stats, infos, model, thinking_leve
                        help="과거 수익률을 그대로 미래에 투영하면 과대추정되기 쉬워 사전값과 혼합합니다.")
     prior = c4.number_input("사전 기대수익 (연 %)", -20.0, 40.0, 7.0, 0.5) / 100
 
-    news_hash = hashlib.md5(json.dumps({t: [n["title"] for n in news.get(t, [])] for t in available},
+    # 종목이 많으면 Gemini 분석 대상 종목을 고를 수 있게 함
+    ai_targets = st.multiselect("Gemini 분석 대상 종목", available, default=available, key="ai_targets",
+                                format_func=_ticker_label,
+                                help="종목이 많을수록 요청이 길어지고 느려집니다. 필요한 종목만 고르세요.")
+    news_hash = hashlib.md5(json.dumps({t: [n["title"] for n in news.get(t, [])] for t in ai_targets},
                                        ensure_ascii=False).encode()).hexdigest()
     cached = ss.scenario_ai
     stale = cached and (cached.get("hash") != news_hash or cached.get("horizon") != horizon)
 
     b1, b2 = st.columns([1, 3])
-    run = b1.button("✨ Gemini로 뉴스 분석·시나리오 생성", type="primary", disabled=not key_ok, width="stretch")
+    run = b1.button("✨ Gemini로 뉴스 분석·시나리오 생성", type="primary",
+                    disabled=not key_ok or not ai_targets, width="stretch")
     if not key_ok:
         b2.info("Gemini API 키가 없어 규칙 기반 감성으로 시나리오를 구성합니다.")
     elif stale:
-        b2.warning("뉴스나 예측 기간이 바뀌었습니다. 다시 생성하면 최신 뉴스가 반영됩니다.")
+        b2.warning("뉴스·대상 종목·예측 기간이 바뀌었습니다. 다시 생성하면 최신 뉴스가 반영됩니다.")
     elif cached:
         b2.success(f"Gemini 분석 결과 사용 중 · {cached.get('model')} · 사고 수준 {cached.get('level')}")
 
     if run:
-        payload = build_news_payload(available, news, stats, horizon)
+        payload = build_news_payload(ai_targets, news, stats, horizon)
         prompt = ("아래 JSON의 종목별 Google 뉴스 헤드라인(index 포함)과 시장 통계를 분석해 "
                   f"향후 {horizon} 거래일 시나리오 파라미터를 산출하세요. 모든 종목을 포함하세요.\n\n"
                   + json.dumps(payload, ensure_ascii=False, default=str))
@@ -898,7 +1094,8 @@ def scenario_tab(available, price_data, news, stats, infos, model, thinking_leve
                 status.update(label="분석 완료", state="complete", expanded=False)
             except Exception as exc:  # noqa: BLE001
                 status.update(label="Gemini 요청 실패", state="error")
-                st.error(f"Gemini 오류: {exc}")
+                st.error(f"Gemini 오류: {gemini_error_message(exc)}")
+                return
         st.rerun(scope="app")  # 뉴스 탭의 AI 감성 표시도 갱신
 
     ai = (ss.scenario_ai or {}).get("result")
@@ -910,7 +1107,7 @@ def scenario_tab(available, price_data, news, stats, infos, model, thinking_leve
         if ss.scenario_ai.get("usage"):
             st.caption(ss.scenario_ai["usage"])
 
-    sym = st.selectbox("시뮬레이션 종목", available, key="mc_sym")
+    sym = st.selectbox("시뮬레이션 종목", available, key="mc_sym", format_func=_ticker_label)
     assess = next((a for a in (ai or {}).get("assessments", []) if a["ticker"] == sym), None)
     if assess:
         scen = assess["scenarios"]
@@ -1075,7 +1272,8 @@ def portfolio_tab(available, returns, bench_ret, benchmark, rf):
             st.plotly_chart(px.imshow(returns.corr(), text_auto=".2f", color_continuous_scale="RdBu_r",
                                       zmin=-1, zmax=1, title="수익률 상관관계").update_layout(height=340),
                             width="stretch")
-    st.caption("과거 수익률 기반 추정치이며 미래 손실을 보장하거나 예측하지 않습니다.")
+    st.caption("과거 수익률 기반 추정치이며 미래 손실을 보장하거나 예측하지 않습니다. "
+               "통화가 다른 종목(예: 원화·달러)을 섞으면 환율 효과는 반영되지 않습니다.")
 
 
 # ----------------------------- Tab: Backtest -----------------------------
@@ -1083,7 +1281,7 @@ def portfolio_tab(available, returns, bench_ret, benchmark, rf):
 def backtest_tab(available, price_data):
     st.subheader("이동평균 교차 전략 백테스트")
     c1, c2, c3, c4 = st.columns(4)
-    sym = c1.selectbox("종목", available, key="bt_symbol")
+    sym = c1.selectbox("종목", available, key="bt_symbol", format_func=_ticker_label)
     fast = c2.slider("단기 MA", 3, 60, 10)
     slow = c3.slider("장기 MA", 10, 200, 40)
     cost = c4.number_input("거래비용 (bps, 편도)", 0.0, 100.0, 5.0, 1.0)
@@ -1126,8 +1324,11 @@ def backtest_tab(available, price_data):
 @st.fragment
 def dcf_tab(available, infos):
     st.subheader("DCF 기업가치 시나리오")
-    sym = st.selectbox("참고 종목 (yfinance 값으로 기본값 채움)", ["직접 입력"] + available, key="dcf_sym")
+    sym = st.selectbox("참고 종목 (yfinance 값으로 기본값 채움)", ["직접 입력"] + available, key="dcf_sym",
+                       format_func=lambda s: s if s == "직접 입력" else _ticker_label(s))
     info = infos.get(sym, {}) if sym != "직접 입력" else {}
+    if info and info.get("quoteType") not in (None, "EQUITY"):
+        st.info(f"{sym}은(는) 개별 기업 주식이 아니라 {info.get('quoteType')} 유형이라 DCF 기본값이 없을 수 있습니다.")
     base_fcf = float(info.get("freeCashflow") or 1_000_000_000)
     nd = float((info.get("totalDebt") or 0) - (info.get("totalCash") or 0))
     shares = float(info.get("sharesOutstanding") or 0)
@@ -1174,21 +1375,22 @@ def analyst_tab(available, period, stats, news, infos, model, thinking_level, sh
     st.subheader("Gemini AI 애널리스트")
     st.write("시장 통계, Google 뉴스, 시나리오 예측 결과를 컨텍스트로 Gemini가 사고 모드로 분석합니다. 대화가 이어집니다.")
     if not key_ok:
-        st.warning("Gemini API 키가 없습니다. README의 Streamlit Secrets 안내를 따라주세요.")
+        st.warning("Gemini API 키가 없습니다. 저장소의 .env 파일에 GEMINI_API_KEY를 넣어주세요.")
     top = st.columns([3, 1])
     top[0].caption(f"모델 `{model}` · 사고 수준 `{thinking_level}`")
     if top[1].button("대화 초기화", width="stretch"):
         ss.chat = []
     ai = (ss.scenario_ai or {}).get("result")
+    news_per = 10 if len(available) <= 15 else 5  # 종목이 많으면 컨텍스트 크기를 줄임
     context = {
         "as_of_utc": datetime.now(timezone.utc).isoformat(timespec="minutes"),
         "period": period,
         "market_stats": stats,
-        "companies": {t: {k: infos.get(t, {}).get(k) for k in ("longName", "sector", "industry", "marketCap",
-                                                               "trailingPE", "forwardPE", "currency")}
+        "companies": {t: {k: infos.get(t, {}).get(k) for k in ("longName", "quoteType", "sector", "industry",
+                                                               "marketCap", "trailingPE", "forwardPE", "currency")}
                       for t in available},
         "google_news": {t: [{"title": n["title"], "source": n["source"], "published": n["published"]}
-                            for n in news.get(t, [])[:10]] for t in available},
+                            for n in news.get(t, [])[:news_per]] for t in available},
         "scenario_analysis": ({"market_overview": ai.get("market_overview"),
                                "assessments": [{k: a.get(k) for k in ("ticker", "sentiment_score", "confidence",
                                                                      "summary", "scenarios", "tail_event")}
@@ -1237,7 +1439,7 @@ def analyst_tab(available, period, stats, news, infos, model, thinking_level, sh
                 st.caption(usage_caption(usage))
         except Exception as exc:  # noqa: BLE001
             ss.chat.pop()
-            st.error(f"Gemini 요청 실패: {exc}")
+            st.error(f"Gemini 요청 실패: {gemini_error_message(exc)}")
 
 
 if __name__ == "__main__":

@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.streamlit/secrets.toml
+.DS_Store
+*.db
+*.sqlite
+.pytest_cache/
+# .env는 API 키와 함께 저장소에 올리도록 의도적으로 제외하지 않았습니다.

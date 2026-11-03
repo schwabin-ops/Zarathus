@@ -1,6 +1,6 @@
 # Aegis Financial Intelligence 설정
 # 아래 YOUR_GEMINI_API_KEY 자리에 Google AI Studio에서 발급한 키를 붙여넣으세요.
-GEMINI_API_KEY=YOUR_GEMINI_API_KEY
+GEMINI_API_KEY=AQ.Ab8RN6J1NWBc-7nwcDpg4cJlNoFsoa4H81eSDzfNj_K64kcsUQ
 
 # 선택 사항
 GEMINI_MODEL=gemini-flash-latest
